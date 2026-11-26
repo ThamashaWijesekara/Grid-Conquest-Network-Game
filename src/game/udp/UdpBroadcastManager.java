@@ -1,5 +1,9 @@
 package game.udp;
 
+import game.security.PacketSecurity;
+import game.security.SecurityConfig;
+import game.security.TokenManager;
+
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -9,12 +13,17 @@ import java.nio.charset.StandardCharsets;
 public class UdpBroadcastManager {
     private final int port;
     private final UdpEventListener listener;
+    private final PacketSecurity packetSecurity;
+    private final TokenManager tokenManager;
+    private final java.util.Map<String, String> playerTokens = new java.util.concurrent.ConcurrentHashMap<>();
     private DatagramSocket socket;
     private volatile boolean running = true;
 
     public UdpBroadcastManager(int port, UdpEventListener listener) {
         this.port = port;
         this.listener = listener;
+        this.tokenManager = new TokenManager(SecurityConfig.sharedSecret(), SecurityConfig.TOKEN_LIFETIME);
+        this.packetSecurity = new PacketSecurity(tokenManager);
     }
 
     public void start() {
@@ -55,8 +64,13 @@ public class UdpBroadcastManager {
     private void sendPacket(String message) {
         if (socket == null || socket.isClosed()) return;
 
+        String[] fields = message.split("\\|", 3);
+        if (fields.length < 2) return;
+        String token = playerTokens.computeIfAbsent(fields[1], tokenManager::issue);
+        String securedMessage = packetSecurity.protect(message, token);
+
         Thread sender = new Thread(() -> {
-            byte[] data = message.getBytes(StandardCharsets.UTF_8);
+            byte[] data = securedMessage.getBytes(StandardCharsets.UTF_8);
             try {
                 DatagramPacket localPacket = new DatagramPacket(
                         data, data.length, InetAddress.getLoopbackAddress(), port
@@ -84,8 +98,13 @@ public class UdpBroadcastManager {
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
-                String msg = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8).trim();
-                handleMessage(msg);
+                String secured = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8).trim();
+                PacketSecurity.VerifiedPacket verified = packetSecurity.verify(secured);
+                if (verified != null) {
+                    handleMessage(verified.payload());
+                } else {
+                    System.err.println("Rejected unauthenticated or modified UDP packet");
+                }
             } catch (Exception e) {
                 if (running) e.printStackTrace();
             }
