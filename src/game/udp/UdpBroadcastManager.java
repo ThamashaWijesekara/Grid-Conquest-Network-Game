@@ -117,31 +117,53 @@ public class UdpBroadcastManager {
 
         String type = parts[0];
         String playerId = parts[1];
+        if (!validPlayerId(playerId)) return;
 
         try {
             switch (type) {
-                case "JOIN" -> listener.onRemotePlayerJoin(playerId);
+                case "JOIN" -> {
+                    if (parts.length == 3 && "ONLINE".equals(parts[2])) {
+                        listener.onRemotePlayerJoin(playerId);
+                    }
+                }
                 case "HOVER" -> {
                     if (parts.length == 4) {
-                        listener.onRemoteHover(playerId, Integer.parseInt(parts[2]), Integer.parseInt(parts[3]));
+                        int row = Integer.parseInt(parts[2]);
+                        int col = Integer.parseInt(parts[3]);
+                        if (validCell(row, col)) listener.onRemoteHover(playerId, row, col);
                     }
                 }
                 case "DICE" -> {
                     if (parts.length == 3) {
-                        listener.onRemoteDiceRoll(playerId, Integer.parseInt(parts[2]));
+                        int value = Integer.parseInt(parts[2]);
+                        if (value >= 1 && value <= 6) listener.onRemoteDiceRoll(playerId, value);
                     }
                 }
                 case "CLAIM" -> {
                     if (parts.length == 4) {
-                        listener.onRemoteCellClaim(playerId, Integer.parseInt(parts[2]), Integer.parseInt(parts[3]));
+                        int row = Integer.parseInt(parts[2]);
+                        int col = Integer.parseInt(parts[3]);
+                        if (validCell(row, col)) listener.onRemoteCellClaim(playerId, row, col);
                     }
                 }
-                case "TURN_DONE" -> listener.onRemoteTurnDone(playerId, parts[2]);
+                case "TURN_DONE" -> {
+                    if (parts.length == 3 && validPlayerId(parts[2])) {
+                        listener.onRemoteTurnDone(playerId, parts[2]);
+                    }
+                }
                 default -> {
                 }
             }
         } catch (NumberFormatException ignored) {
         }
+    }
+
+    private static boolean validPlayerId(String playerId) {
+        return playerId != null && playerId.matches("[A-Z0-9_]{2,16}");
+    }
+
+    private static boolean validCell(int row, int col) {
+        return row >= 0 && row < 10 && col >= 0 && col < 10;
     }
 
     public void close() {
