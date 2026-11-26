@@ -26,6 +26,15 @@ public class UdpBroadcastManager {
         this.packetSecurity = new PacketSecurity(tokenManager);
     }
 
+    public UdpBroadcastManager(int port, UdpEventListener listener, String playerId, String token) {
+        this(port, listener);
+        TokenManager.TokenDetails details = tokenManager.verify(token);
+        if (details == null || !details.playerId().equals(playerId)) {
+            throw new IllegalArgumentException("The lobby token is invalid for this player");
+        }
+        playerTokens.put(playerId, token);
+    }
+
     public void start() {
         try {
             socket = new DatagramSocket(null);
