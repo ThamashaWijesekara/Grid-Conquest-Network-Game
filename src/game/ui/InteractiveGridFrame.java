@@ -18,7 +18,12 @@ import java.awt.event.MouseEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.ThreadLocalRandom;
+import game.tcp.TcpGameClient;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 
 public class InteractiveGridFrame extends JFrame implements UdpEventListener {
     private static final int GRID_SIZE = 10;
@@ -64,7 +69,6 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
 
     private boolean soundEnabled = true;
     private int remainingClaims = 0;
-    private boolean isRollingAnimation = false;
 
     private int lastHoverRow = -1;
     private int lastHoverCol = -1;
@@ -72,6 +76,18 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
     private int lastRemoteHoverCol = -1;
 
     private final UdpBroadcastManager udpManager;
+    private volatile TcpGameClient tcpClient;
+    private final ExecutorService tcpSender = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "TCP-Sender");
+        t.setDaemon(true);
+        return t;
+    });
+    private boolean tcpReady;
+    private boolean requestPending;
+    private boolean gameOver;
+    private boolean rolledThisTurn;
+    private volatile boolean closing;
+    private final Set<String> connectedPlayers = new HashSet<>();
 
     public InteractiveGridFrame(String playerId, Color playerColor) {
         this(playerId, playerColor, null);
@@ -79,14 +95,12 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
 
     public InteractiveGridFrame(String playerId, Color playerColor, String authToken) {
         String cleanId = (playerId == null || playerId.isBlank()) ? "P1" : playerId.trim().toUpperCase();
-        Color cleanColor = (playerColor == null) ? new Color(239, 68, 68) : playerColor;
 
+        Color cleanColor = (playerColor == null) ? new Color(239, 68, 68) : playerColor;
         this.currentPlayer = new Player(cleanId, cleanColor);
         ensurePlayerRegistered(this.currentPlayer.id, this.currentPlayer.color);
 
-        this.activePlayerId = "P1";
-        ensurePlayerRegistered("P1", new Color(239, 68, 68));
-        ensurePlayerRegistered("P2", new Color(59, 130, 246));
+        this.activePlayerId = null;
 
         this.udpManager = authToken == null
                 ? new UdpBroadcastManager(UDP_PORT, this)
@@ -107,7 +121,15 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
 
         udpManager.start();
         udpManager.sendJoin(this.currentPlayer.id);
+        addWindowListener(new WindowAdapter() {
+            @Override public void windowClosing(WindowEvent e) {
+                closing = true;
+                tcpSender.shutdownNow();
+                closeTcp();
+            }
+        });
         refreshUIState();
+        startTcp(authToken);
     }
 
     private synchronized void ensurePlayerRegistered(String id, Color color) {
@@ -116,28 +138,17 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
             turnOrder.add(id);
             Collections.sort(turnOrder);
         }
-        if (activePlayerId == null && !turnOrder.isEmpty()) {
-            activePlayerId = turnOrder.get(0);
-        }
+
     }
 
     private synchronized String getActivePlayerId() {
-        if (activePlayerId != null && turnOrder.contains(activePlayerId)) {
-            return activePlayerId;
-        }
-        return turnOrder.isEmpty() ? currentPlayer.id : turnOrder.get(0);
+        return activePlayerId == null ? "-" : activePlayerId;
     }
 
-    private synchronized String computeNextPlayerId(String currentId) {
-        if (turnOrder.isEmpty()) return currentPlayer.id;
-        int idx = turnOrder.indexOf(currentId);
-        if (idx < 0) return turnOrder.get(0);
-        return turnOrder.get((idx + 1) % turnOrder.size());
-    }
+
 
     private synchronized boolean isMyTurn() {
-        if (turnOrder.size() <= 1) return true;
-        return currentPlayer.id.equals(getActivePlayerId());
+        return currentPlayer.id.equals(activePlayerId);
     }
 
     private synchronized void setTurnTo(String nextPlayerId) {
@@ -149,10 +160,12 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
     }
 
     private Color colorForPlayer(String playerId) {
+        if (currentPlayer != null && currentPlayer.id.equals(playerId)) return currentPlayer.color;
         Player p = playersMap.get(playerId);
         if (p != null) return p.color;
-        int hash = Math.abs(playerId.hashCode());
-        return Color.getHSBColor((hash % 360) / 360f, 0.78f, 0.92f);
+        if ("P1".equals(playerId)) return new Color(239, 68, 68);
+        if ("P2".equals(playerId)) return new Color(59, 130, 246);
+        return Color.getHSBColor(Math.floorMod(playerId.hashCode(), 360) / 360f, 0.78f, 0.92f);
     }
 
     private JPanel buildTopHeader() {
@@ -166,7 +179,7 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
         JPanel leftTitle = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
         leftTitle.setOpaque(false);
 
-        JLabel badge = new JLabel("UDP LIVE");
+        JLabel badge = new JLabel("TCP + UDP");
         badge.setOpaque(true);
         badge.setBackground(new Color(30, 58, 138));
         badge.setForeground(ACCENT_CYAN);
@@ -335,7 +348,7 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
         styleUtilityButton(resetBoardButton, new Color(51, 65, 85), new Color(226, 232, 240));
         resetBoardButton.setAlignmentX(Component.CENTER_ALIGNMENT);
         resetBoardButton.setMaximumSize(new Dimension(275, 34));
-        resetBoardButton.addActionListener(e -> resetLocalBoard());
+        resetBoardButton.addActionListener(e -> sendTcp(c -> c.resetBoard()));
 
         hud.add(meBadge);
         hud.add(Box.createVerticalStrut(10));
@@ -392,99 +405,167 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
         return bottom;
     }
 
-    private void triggerDiceRoll() {
-        if (isRollingAnimation) return;
+    @FunctionalInterface
+    private interface TcpAction { void run(TcpGameClient client) throws IOException; }
 
-        if (!isMyTurn()) {
-            playTone(220, 90);
-            statusLabel.setText("⏳ Not your turn! Active turn is " + getActivePlayerId() + ".");
-            return;
-        }
+    private void startTcp(String token) {
+        statusLabel.setText("Connecting to TCP game server...");
+        Thread reader = new Thread(() -> {
+            try (TcpGameClient client = new TcpGameClient(
+                    "localhost", game.server.Protocol.DEFAULT_PORT, currentPlayer.id)) {
+                tcpClient = client;
+                if (closing) return;
+                client.join(token == null ? "ONLINE" : token);
+                client.listen(message -> SwingUtilities.invokeLater(() -> {
+                    if (!closing) handleTcpMessage(message);
+                }));
+            } catch (IOException e) {
+                SwingUtilities.invokeLater(() -> disconnected("TCP: " + e.getMessage()));
+            } finally {
+                tcpClient = null;
+                SwingUtilities.invokeLater(() -> {
+                    if (!closing && tcpReady) disconnected("TCP connection closed.");
+                    else if (!closing) { tcpReady = false; requestPending = false; refreshUIState(); }
+                });
+            }
+        }, "TCP-Receiver");
+        reader.setDaemon(true);
+        reader.start();
+    }
 
-        if (remainingClaims > 0) {
-            playTone(260, 90);
-            statusLabel.setText("🎯 Capture your remaining " + remainingClaims + " tile(s) first!");
-            return;
-        }
-
-        if (claimedCount >= TOTAL_CELLS) {
-            announceWinner();
-            return;
-        }
-
-        isRollingAnimation = true;
-        rollButton.setEnabled(false);
-        playTone(520, 70);
-
-        final int finalRoll = ThreadLocalRandom.current().nextInt(1, 7);
-        final int[] ticks = {0};
-
-        javax.swing.Timer animTimer = new javax.swing.Timer(65, evt -> {
-            ticks[0]++;
-            int preview = ThreadLocalRandom.current().nextInt(1, 7);
-            diceNumberLabel.setText(String.valueOf(preview));
-            playTone(400 + preview * 45, 25);
-
-            if (ticks[0] >= 8) {
-                ((javax.swing.Timer) evt.getSource()).stop();
-                isRollingAnimation = false;
-
-                remainingClaims = finalRoll;
-                diceNumberLabel.setText(String.valueOf(finalRoll));
-                lastRollLabel.setText("Last Roll: " + currentPlayer.id + " rolled " + finalRoll);
-                statusLabel.setText("🎲 " + currentPlayer.id + " rolled " + finalRoll + "! Select " + finalRoll + " free tile(s).");
-                playTone(760, 120);
-
-                udpManager.sendDiceRoll(currentPlayer.id, finalRoll);
-                refreshUIState();
+    private void sendTcp(TcpAction action) {
+        if (!tcpReady || requestPending || closing) return;
+        TcpGameClient client = tcpClient;
+        if (client == null) { disconnected("TCP connection unavailable."); return; }
+        requestPending = true;
+        refreshUIState();
+        tcpSender.execute(() -> {
+            try { action.run(client); }
+            catch (IOException e) {
+                closeTcp();
+                SwingUtilities.invokeLater(() -> disconnected("TCP send failed: " + e.getMessage()));
             }
         });
-        animTimer.start();
+    }
+
+    private void closeTcp() {
+        TcpGameClient client = tcpClient;
+        if (client != null) {
+            try { client.close(); } catch (IOException ignored) { }
+        }
+    }
+
+    private void disconnected(String reason) {
+        if (closing) return;
+        tcpReady = false;
+        requestPending = false;
+        statusLabel.setText(reason);
+        refreshUIState();
+    }
+
+    private void handleTcpMessage(String message) {
+        String[] p = message.split("\\|", -1);
+        try {
+            switch (p[0]) {
+                case "WELCOME" -> {
+                    if (Integer.parseInt(p[2]) != GRID_SIZE) throw new IllegalArgumentException("Grid size mismatch");
+                    statusLabel.setText("Synchronizing board...");
+                }
+                case "ROSTER" -> {
+                    playersMap.clear(); turnOrder.clear(); connectedPlayers.clear();
+                    for (String entry : p[3].split(",")) {
+                        if (entry.isBlank()) continue;
+                        String id = entry.split(":", 2)[0];
+                        ensurePlayerRegistered(id, colorForPlayer(id));
+                        connectedPlayers.add(id);
+                    }
+                    // Snapshot CELL events reconstruct scores, so do not count roster scores twice.
+                    activePlayerId = p[1];
+                    remainingClaims = Integer.parseInt(p[2]);
+                    rolledThisTurn = remainingClaims > 0;
+                }
+                case "CELL", "CLAIM" -> {
+                    int row = Integer.parseInt(p[2]), col = Integer.parseInt(p[3]);
+                    if (row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE)
+                        throw new IllegalArgumentException("Invalid cell");
+                    boolean fresh = cellOwners[row][col] == null;
+                    applyCellClaim(p[1], row, col);
+                    if (p[0].equals("CLAIM")) {
+                        if (fresh && p[1].equals(activePlayerId)) remainingClaims = Math.max(0, remainingClaims - 1);
+                        if (p[1].equals(currentPlayer.id)) requestPending = false;
+                        statusLabel.setText(p[1] + " captured (" + row + ", " + col + ")");
+                        playTone(640, 85);
+                    }
+                }
+                case "SNAPSHOT_END" -> {
+                    if (Integer.parseInt(p[1]) != claimedCount) throw new IllegalArgumentException("Incomplete snapshot");
+                    tcpReady = true;
+                    gameOver = claimedCount == TOTAL_CELLS;
+                    statusLabel.setText("TCP connected. Active player: " + activePlayerId);
+                }
+                case "JOIN" -> {
+                    connectedPlayers.add(p[1]);
+                    ensurePlayerRegistered(p[1], colorForPlayer(p[1]));
+                }
+                case "LEAVE" -> connectedPlayers.remove(p[1]);
+                case "DICE" -> {
+                    rolledThisTurn = true;
+                    activePlayerId = p[1];
+                    remainingClaims = Integer.parseInt(p[2]);
+                    diceNumberLabel.setText(p[2]);
+                    lastRollLabel.setText("Last Roll: " + p[1] + " rolled " + p[2]);
+                    statusLabel.setText(p[1] + " rolled " + p[2]);
+                    if (p[1].equals(currentPlayer.id)) requestPending = false;
+                    playTone(760, 120);
+                }
+                case "TURN_DONE" -> {
+                    setTurnTo(p[2]);
+                    rolledThisTurn = false;
+                    statusLabel.setText("Turn passed to " + p[2]);
+                }
+                case "RESET" -> {
+                    resetLocalBoard();
+                    activePlayerId = p[2];
+                    gameOver = false;
+                    rolledThisTurn = false;
+                    if (p[1].equals(currentPlayer.id)) requestPending = false;
+                    statusLabel.setText("Board reset by " + p[1]);
+                }
+                case "GAME_OVER" -> {
+                    gameOver = true;
+                    requestPending = false;
+                    remainingClaims = 0;
+                    String result = "Match complete! Winner(s): " + p[1] + " with " + p[2] + " points";
+                    statusLabel.setText(result);
+                    playTone(880, 220);
+                    SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this, result, "Victory!", JOptionPane.INFORMATION_MESSAGE));
+                }
+                case "ERROR" -> {
+                    requestPending = false;
+                    statusLabel.setText(p[1] + ": " + (p.length > 2 ? p[2] : ""));
+                }
+                case "NOTICE" -> statusLabel.setText(p[1]);
+                default -> { }
+            }
+            refreshUIState();
+        } catch (RuntimeException e) {
+            disconnected("Invalid TCP event: " + p[0]);
+            closeTcp();
+        }
+    }
+
+    private void triggerDiceRoll() {
+        if (!tcpReady || requestPending || gameOver || !isMyTurn() || rolledThisTurn || remainingClaims != 0) return;
+        sendTcp(TcpGameClient::rollDice);
     }
 
     private void handleCellClick(int row, int col) {
-        if (isRollingAnimation) return;
-
-        if (!isMyTurn()) {
-            playTone(220, 90);
-            statusLabel.setText("⏳ Wait for your turn! Currently " + getActivePlayerId() + "'s turn.");
+        if (!tcpReady || requestPending || gameOver || !isMyTurn() || remainingClaims <= 0) return;
+        if (cellOwners[row][col] != null) {
+            statusLabel.setText("Tile already captured.");
             return;
         }
-
-        if (remainingClaims <= 0) {
-            playTone(240, 90);
-            statusLabel.setText("🎲 Roll the dice first to unlock tile claims!");
-            return;
-        }
-
-        String owner = cellOwners[row][col];
-        if (owner != null) {
-            playTone(190, 110);
-            statusLabel.setText("🔒 Tile (" + row + "," + col + ") is already claimed by " + owner + "!");
-            return;
-        }
-
-        applyCellClaim(currentPlayer.id, row, col);
-        udpManager.sendCellClaim(currentPlayer.id, row, col);
-        playTone(640, 85);
-
-        remainingClaims--;
-
-        if (claimedCount >= TOTAL_CELLS) {
-            announceWinner();
-            return;
-        }
-
-        if (remainingClaims == 0) {
-            String nextPlayer = computeNextPlayerId(currentPlayer.id);
-            setTurnTo(nextPlayer);
-            udpManager.sendTurnDone(currentPlayer.id, nextPlayer);
-            statusLabel.setText("✅ Turn complete! Passing turn to " + nextPlayer + ".");
-        } else {
-            statusLabel.setText("🔥 Claimed (" + row + "," + col + ")! " + remainingClaims + " more tile(s) to claim.");
-        }
-
-        refreshUIState();
+        sendTcp(c -> c.claimCell(row, col));
     }
 
     private synchronized void applyCellClaim(String playerId, int row, int col) {
@@ -567,6 +648,7 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
                     .append("<span style='color:").append(hex).append(";'>■</span> ")
                     .append("<b>").append(id).append("</b>").append(youTag)
                     .append(" — <b>").append(sc).append("</b> pts")
+                    .append(connectedPlayers.contains(id) ? "" : " (offline)")
                     .append(turnTag)
                     .append("</div>");
         }
@@ -583,26 +665,14 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
         turnBannerLabel.setForeground(BG_DARK);
 
         remainingLabel.setText("Claims Left: " + remainingClaims);
-        rollButton.setEnabled(!isRollingAnimation && myTurn && remainingClaims == 0 && claimedCount < TOTAL_CELLS);
+        rollButton.setEnabled(tcpReady && !requestPending && !gameOver && myTurn && !rolledThisTurn && remainingClaims == 0 && claimedCount < TOTAL_CELLS);
+        resetBoardButton.setEnabled(tcpReady && !requestPending);
+
 
         refreshRosterBoard();
     }
 
-    private void announceWinner() {
-        Player winner = null;
-        for (Player p : playersMap.values()) {
-            if (winner == null || p.score > winner.score) {
-                winner = p;
-            }
-        }
-        String msg = winner != null
-                ? "🏆 Match Complete! Champion: " + winner.id + " (" + winner.score + " tiles)"
-                : "🏆 Match Complete!";
-        statusLabel.setText(msg);
-        rollButton.setEnabled(false);
-        playTone(880, 220);
-        JOptionPane.showMessageDialog(this, msg, "Victory!", JOptionPane.INFORMATION_MESSAGE);
-    }
+
 
     private void applyLocalHover(int row, int col) {
         SwingUtilities.invokeLater(() -> {
@@ -657,15 +727,12 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
 
     @Override
     public void onRemotePlayerJoin(String playerId) {
-        SwingUtilities.invokeLater(() -> {
-            ensurePlayerRegistered(playerId, colorForPlayer(playerId));
-            refreshUIState();
-        });
+        // Authoritative game state arrives over TCP only.
     }
 
     @Override
     public void onRemoteHover(String playerId, int row, int col) {
-        if (playerId.equals(currentPlayer.id)) return;
+        if (playerId.equals(currentPlayer.id) || row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE) return;
         SwingUtilities.invokeLater(() -> {
             if (lastRemoteHoverRow != -1 && lastRemoteHoverCol != -1) {
                 resetTileHighlight(lastRemoteHoverRow, lastRemoteHoverCol);
@@ -681,31 +748,17 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
 
     @Override
     public void onRemoteDiceRoll(String playerId, int diceValue) {
-        if (playerId.equals(currentPlayer.id)) return;
-        SwingUtilities.invokeLater(() -> {
-            diceNumberLabel.setText(String.valueOf(diceValue));
-            lastRollLabel.setText("Last Roll: " + playerId + " rolled " + diceValue);
-            statusLabel.setText("🎲 " + playerId + " rolled " + diceValue + "!");
-        });
+        // Authoritative game state arrives over TCP only.
     }
 
     @Override
     public void onRemoteCellClaim(String playerId, int row, int col) {
-        if (playerId.equals(currentPlayer.id)) return;
-        SwingUtilities.invokeLater(() -> {
-            applyCellClaim(playerId, row, col);
-            statusLabel.setText("⚡ " + playerId + " captured (" + row + ", " + col + ")");
-        });
+        // Authoritative game state arrives over TCP only.
     }
 
     @Override
     public void onRemoteTurnDone(String finishedPlayerId, String nextPlayerId) {
-        if (finishedPlayerId.equals(currentPlayer.id)) return;
-        SwingUtilities.invokeLater(() -> {
-            setTurnTo(nextPlayerId);
-            refreshUIState();
-            statusLabel.setText("🔄 Turn passed to " + getActivePlayerId() + "!");
-        });
+        // Authoritative game state arrives over TCP only.
     }
 
     private static class GridTileButton extends JButton {
