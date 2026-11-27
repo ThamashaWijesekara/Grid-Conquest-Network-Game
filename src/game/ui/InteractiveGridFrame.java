@@ -1,6 +1,8 @@
 package game.ui;
 
 import game.model.Player;
+import game.security.SecureLobbyClient;
+import game.security.SecurityConfig;
 import game.udp.UdpBroadcastManager;
 import game.udp.UdpEventListener;
 
@@ -72,6 +74,10 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
     private final UdpBroadcastManager udpManager;
 
     public InteractiveGridFrame(String playerId, Color playerColor) {
+        this(playerId, playerColor, null);
+    }
+
+    public InteractiveGridFrame(String playerId, Color playerColor, String authToken) {
         String cleanId = (playerId == null || playerId.isBlank()) ? "P1" : playerId.trim().toUpperCase();
         Color cleanColor = (playerColor == null) ? new Color(239, 68, 68) : playerColor;
 
@@ -82,7 +88,9 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
         ensurePlayerRegistered("P1", new Color(239, 68, 68));
         ensurePlayerRegistered("P2", new Color(59, 130, 246));
 
-        this.udpManager = new UdpBroadcastManager(UDP_PORT, this);
+        this.udpManager = authToken == null
+                ? new UdpBroadcastManager(UDP_PORT, this)
+                : new UdpBroadcastManager(UDP_PORT, this, cleanId, authToken);
 
         setTitle("GRID CONQUEST // " + this.currentPlayer.id + " — Multiplayer Grid Arena");
         setSize(1080, 740);
@@ -796,7 +804,31 @@ public class InteractiveGridFrame extends JFrame implements UdpEventListener {
                 color = parseColorArg(chosenColor);
             }
 
-            new InteractiveGridFrame(playerId, color).setVisible(true);
+            JPasswordField passwordField = new JPasswordField();
+            int result = JOptionPane.showConfirmDialog(
+                    null, passwordField, "Password for " + playerId,
+                    JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE
+            );
+            if (result != JOptionPane.OK_OPTION) return;
+
+            char[] password = passwordField.getPassword();
+            try {
+                SecureLobbyClient lobby = new SecureLobbyClient("localhost", SecurityConfig.LOBBY_PORT);
+                String response = lobby.login(playerId, password);
+                if (response == null || !response.startsWith("AUTH_OK|")) {
+                    JOptionPane.showMessageDialog(null, "Login failed: " + response,
+                            "Secure Lobby", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                String token = response.substring("AUTH_OK|".length());
+                new InteractiveGridFrame(playerId, color, token).setVisible(true);
+            } catch (Exception e) {
+                JOptionPane.showMessageDialog(null,
+                        "Cannot reach the secure lobby: " + e.getMessage(),
+                        "Secure Lobby", JOptionPane.ERROR_MESSAGE);
+            } finally {
+                java.util.Arrays.fill(password, '\0');
+            }
         });
     }
 }

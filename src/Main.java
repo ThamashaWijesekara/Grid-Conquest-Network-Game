@@ -1,15 +1,24 @@
-//TIP To <b>Run</b> code, press <shortcut actionId="Run"/> or
-// click the <icon src="AllIcons.Actions.Execute"/> icon in the gutter.
-public class Main {
-    public static void main(String[] args) {
-        //TIP Press <shortcut actionId="ShowIntentionActions"/> with your caret at the highlighted text
-        // to see how IntelliJ IDEA suggests fixing it.
-        System.out.printf("Hello and welcome!");
+import game.security.SecureLobbyServer;
+import game.server.GameServer;
+import game.server.demo.BotClient;
+import game.server.demo.StressTest;
+import game.ui.InteractiveGridFrame;
 
-        for (int i = 1; i <= 5; i++) {
-            //TIP Press <shortcut actionId="Debug"/> to start debugging your code. We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-            // for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.
-            System.out.println("i = " + i);
+import java.util.Arrays;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        if (args.length > 0 && "server".equalsIgnoreCase(args[0])) {
+            SecureLobbyServer.main(new String[0]);
+        } else if (args.length > 0 && "game-server".equalsIgnoreCase(args[0])) {
+            // Member 03: multi-threaded NIO game server (see docs/MEMBER3_SERVER.md)
+            GameServer.main(Arrays.copyOfRange(args, 1, args.length));
+        } else if (args.length > 0 && "game-bot".equalsIgnoreCase(args[0])) {
+            BotClient.main(Arrays.copyOfRange(args, 1, args.length));
+        } else if (args.length > 0 && "game-stress".equalsIgnoreCase(args[0])) {
+            StressTest.main(Arrays.copyOfRange(args, 1, args.length));
+        } else {
+            InteractiveGridFrame.main(args);
         }
     }
 }

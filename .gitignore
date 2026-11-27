@@ -37,3 +37,6 @@ build/
 # IDE files
 .idea/
 *.iml
+
+# Local TLS keys (generate with setup-security.ps1)
+config/*.p12
